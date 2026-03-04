@@ -67,6 +67,7 @@ sub install_xsub {
 # 3. Install all the functions we need from the library.
 install_xsub("bootstrap", $libref);
 install_xsub("loop", $libref);
+install_xsub("watch", $libref);
 install_xsub("play", $libref);
 install_xsub("pause_command", $libref);
 install_xsub("toggle_play_pause", $libref);
@@ -84,6 +85,8 @@ bootstrap();
 # 5. Execute the requested command by calling the newly installed subroutine.
 if ($command eq 'loop') {
     loop();
+} elsif ($command eq 'watch') {
+    watch();
 } elsif ($command eq 'play') {
     play();
 } elsif ($command eq 'pause') {

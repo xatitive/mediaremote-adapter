@@ -60,8 +60,8 @@ static NSString *serializeData(NSDictionary *data, BOOL diff) {
                                             formatError(error)]);
         return nil;
     }
-    return [[NSString alloc] initWithData:serialized
-                                 encoding:NSUTF8StringEncoding];
+    return [[[NSString alloc] initWithData:serialized
+                                  encoding:NSUTF8StringEncoding] autorelease];
 }
 
 static NSMutableDictionary *
@@ -167,7 +167,7 @@ static NSDictionary *createDiff(NSDictionary *a, NSDictionary *b) {
             diff[key] = newValue ?: [NSNull null];
         }
     }
-    return [diff copy];
+    return [[diff copy] autorelease];
 }
 
 static bool isSameItemIdentity(NSDictionary *a, NSDictionary *b) {
@@ -232,7 +232,7 @@ static void fetchAndProcess(int pid) {
             printOut(@"NIL");
             return;
         }
-        NSDictionary *infoDict = [(__bridge NSDictionary *)information copy];
+        NSDictionary *infoDict = [[(__bridge NSDictionary *)information copy] autorelease];
         MRMediaRemoteGetNowPlayingApplicationIsPlaying(_queue, ^(Boolean isPlaying) {
             void (^processWithPid)(int) = ^(int finalPid) {
                 if (finalPid > 0) {
@@ -260,35 +260,23 @@ static void fetchAndProcess(int pid) {
     });
 }
 
-// Check if parent process is still alive
-static void checkParentProcess(void) {
-    if (_parentPID > 0) {
-        // Use kill(pid, 0) to check if process exists without sending a signal
-        if (kill(_parentPID, 0) != 0) {
-            // Parent process is dead, terminate this process
-            printErr(@"Parent process died, terminating");
-            exit(0);
-        }
-    }
-}
-
-// Set up periodic parent process monitoring
+// Event-based parent process monitoring using dispatch source.
+// This watches for the parent process to exit via a kernel event,
+// eliminating the need for a periodic timer.
 static void setupParentMonitoring(void) {
-    _parentPID = getppid(); // Get parent process ID
+    _parentPID = getppid();
+    if (_parentPID <= 1) return; // Already orphaned or is launchd
 
-    // Create a timer that checks parent process every 5 seconds
-    _parentMonitorTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
-    if (_parentMonitorTimer) {
-        dispatch_source_set_timer(_parentMonitorTimer,
-                                 dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                                 5 * NSEC_PER_SEC,
-                                 1 * NSEC_PER_SEC);
+    dispatch_source_t source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_PROC, _parentPID, DISPATCH_PROC_EXIT, _queue);
 
-        dispatch_source_set_event_handler(_parentMonitorTimer, ^{
-            checkParentProcess();
+    if (source) {
+        dispatch_source_set_event_handler(source, ^{
+            printErr(@"Parent process exited, terminating");
+            exit(0);
         });
-
-        dispatch_resume(_parentMonitorTimer);
+        dispatch_resume(source);
+        _parentMonitorTimer = source;
     }
 }
 
@@ -300,7 +288,7 @@ void bootstrap(void) {
     // This is set by the Perl script based on the `--id` command-line argument.
     const char *bundleIdEnv = getenv("MEDIAREMOTEADAPTER_bundle_identifier");
     if (bundleIdEnv != NULL) {
-        _targetBundleIdentifier = [NSString stringWithUTF8String:bundleIdEnv];
+        _targetBundleIdentifier = [[NSString alloc] initWithUTF8String:bundleIdEnv];
     }
 
     // Set up parent process monitoring
@@ -322,9 +310,10 @@ void loop(void) {
     });
 
     void (^handler)(NSNotification *) = ^(NSNotification *notification) {
-      // If there's an existing block scheduled, cancel it.
+      // If there's an existing block scheduled, cancel and release it.
       if (_debounce_block) {
           dispatch_block_cancel(_debounce_block);
+          Block_release(_debounce_block);
       }
 
       // Create a new block to be executed after the delay.
@@ -346,6 +335,73 @@ void loop(void) {
 
     [[NSNotificationCenter defaultCenter]
         addObserverForName:(NSString *)kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification
+                    object:nil
+                     queue:nil
+                usingBlock:handler];
+
+    CFRunLoopRun();
+}
+
+void watch(void) {
+    _runLoop = CFRunLoopGetCurrent();
+
+    // Declare this as a background activity so the system knows it is
+    // eligible for App Nap and does not prevent idle sleep.
+    // Retain the token to keep the activity alive for the process lifetime.
+    id activity __attribute__((unused)) =
+        [[[NSProcessInfo processInfo]
+            beginActivityWithOptions:NSActivityBackground
+                              reason:@"Waiting for media remote notifications"] retain];
+
+    MRMediaRemoteRegisterForNowPlayingNotifications(
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0));
+
+    // Lightweight notification handler that only emits a "CHANGED" signal.
+    // No data fetching or serialization happens here — the parent process
+    // is responsible for spawning a separate `get` command to retrieve data.
+    void (^handler)(NSNotification *) = ^(NSNotification *notification) {
+      // If there's an existing block scheduled, cancel and release it.
+      if (_debounce_block) {
+          dispatch_block_cancel(_debounce_block);
+          Block_release(_debounce_block);
+      }
+
+      _debounce_block = dispatch_block_create(0, ^{
+          // If a target bundle ID is set, check the PID to avoid
+          // emitting signals for unrelated applications.
+          if (_targetBundleIdentifier) {
+              MRMediaRemoteGetNowPlayingApplicationPID(_queue, ^(int pid) {
+                  if (pid > 0) {
+                      NSRunningApplication *app =
+                          [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+                      if (app && app.bundleIdentifier &&
+                          ![app.bundleIdentifier isEqual:_targetBundleIdentifier]) {
+                          return; // Not from our target app, skip.
+                      }
+                  }
+                  printOut(@"CHANGED");
+              });
+          } else {
+              printOut(@"CHANGED");
+          }
+      });
+
+      dispatch_after(
+          dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+          _queue, _debounce_block);
+    };
+
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:(NSString *)
+                               kMRMediaRemoteNowPlayingInfoDidChangeNotification
+                    object:nil
+                     queue:nil
+                usingBlock:handler];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:
+            (NSString *)
+                kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification
                     object:nil
                      queue:nil
                 usingBlock:handler];
@@ -416,7 +472,7 @@ void get(void) {
             completed = YES;
             return;
         }
-        NSDictionary *infoDict = [(__bridge NSDictionary *)information copy];
+        NSDictionary *infoDict = [[(__bridge NSDictionary *)information copy] autorelease];
         MRMediaRemoteGetNowPlayingApplicationIsPlaying(_queue, ^(Boolean isPlaying) {
             MRMediaRemoteGetNowPlayingApplicationPID(_queue, ^(int fetchedPid) {
                 if (fetchedPid > 0) {

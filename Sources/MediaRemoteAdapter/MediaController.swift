@@ -10,20 +10,19 @@ public class MediaController {
         return path
     }
 
-    private var listeningProcess: Process?
-    private var dataBuffer = Data()
-    private var playbackTimer: Timer?
-    private var playbackInfo: (baseTime: TimeInterval, baseTimestamp: TimeInterval)?
-    private var currentTrackIdentifier: String?
-    private var isPlaying = false
-    private var seekTimer: Timer?
-    private var eventCount = 0
-    private let restartThreshold = 100
+    private var watchProcess: Process?
+    private var watchDataBuffer = Data()
+    private var seekDebounceItem: DispatchWorkItem?
+    private var fetchDebounceItem: DispatchWorkItem?
+    private var fetchGeneration: UInt = 0
+
+    /// The most recently received track info. Read `currentTrackInfo?.payload.currentElapsedTime`
+    /// to compute the current playback position on demand without any timers.
+    public private(set) var currentTrackInfo: TrackInfo?
 
     public var onTrackInfoReceived: ((TrackInfo?) -> Void)?
     public var onListenerTerminated: (() -> Void)?
     public var onDecodingError: ((Error, Data) -> Void)?
-    public var onPlaybackTimeUpdate: ((_ elapsedTime: TimeInterval) -> Void)?
     public var bundleIdentifier: String?
 
     public init(bundleIdentifier: String? = nil) {
@@ -102,9 +101,11 @@ public class MediaController {
         let outputPipe = Pipe()
         getProcess.standardOutput = outputPipe
 
-        outputPipe.fileHandleForReading.readabilityHandler = { fileHandle in
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak outputPipe] fileHandle in
             let incomingData = fileHandle.availableData
             if incomingData.isEmpty {
+                // EOF — pipe closed. Stop the handler to prevent a spin loop.
+                outputPipe?.fileHandleForReading.readabilityHandler = nil
                 return
             }
 
@@ -121,6 +122,7 @@ public class MediaController {
 
             if !lineData.isEmpty && !callbackExecuted {
                 callbackExecuted = true
+                outputPipe?.fileHandleForReading.readabilityHandler = nil
                 // Check for NIL response
                 if lineData == "NIL".data(using: .utf8) {
                     DispatchQueue.main.async { onReceive(nil) }
@@ -136,6 +138,7 @@ public class MediaController {
         }
 
         getProcess.terminationHandler = { _ in
+            outputPipe.fileHandleForReading.readabilityHandler = nil
             if !callbackExecuted {
                 DispatchQueue.main.async { onReceive(nil) }
             }
@@ -147,17 +150,88 @@ public class MediaController {
             onReceive(nil)
         }
     }
+    
+    /// returns current playback time (seconds) independently from the listen process.
+    public func getPlaybackTime(_ onReceive: @escaping (TimeInterval?) -> Void) {
+        guard let scriptPath = perlScriptPath else { onReceive(nil); return }
+        guard let libraryPath = libraryPath else { onReceive(nil); return }
+
+        let getProcess = Process()
+        getProcess.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+
+        var getDataBuffer = Data()
+        var callbackExecuted = false
+
+        var arguments = [scriptPath]
+        if let bundleId = bundleIdentifier {
+            arguments.append("--id")
+            arguments.append(bundleId)
+        }
+        arguments.append(contentsOf: [libraryPath, "get"])
+        getProcess.arguments = arguments
+
+        let outputPipe = Pipe()
+        getProcess.standardOutput = outputPipe
+
+        outputPipe.fileHandleForReading.readabilityHandler = { fileHandle in
+            let incomingData = fileHandle.availableData
+            if incomingData.isEmpty { return }
+
+            getDataBuffer.append(incomingData)
+
+            guard let newlineData = "\n".data(using: .utf8),
+                let range = getDataBuffer.firstRange(of: newlineData),
+                range.lowerBound <= getDataBuffer.count
+            else { return }
+
+            let lineData = getDataBuffer.subdata(in: 0..<range.lowerBound)
+            getDataBuffer.removeSubrange(0..<range.upperBound)
+
+            guard !callbackExecuted else { return }
+            callbackExecuted = true
+
+            // nil means “no player”
+            if lineData == "NIL".data(using: .utf8) {
+                DispatchQueue.main.async { onReceive(nil) }
+                return
+            }
+
+            do {
+                let trackInfo = try JSONDecoder().decode(TrackInfo.self, from: lineData)
+                if let micros = trackInfo.payload.elapsedTimeMicros {
+                    DispatchQueue.main.async { onReceive(TimeInterval(micros) / 1_000_000) }
+                } else {
+                    DispatchQueue.main.async { onReceive(nil) }
+                }
+            } catch {
+                DispatchQueue.main.async { onReceive(nil) }
+            }
+        }
+
+        getProcess.terminationHandler = { _ in
+            if !callbackExecuted {
+                DispatchQueue.main.async { onReceive(nil) }
+            }
+        }
+
+        do { try getProcess.run() } catch { onReceive(nil) }
+    }
 
     public func startListening() {
-        guard listeningProcess == nil else {
+        guard watchProcess == nil else {
             return
         }
 
-        eventCount = 0
-        startListeningInternal()
+        startWatchProcess()
+
+        // Fetch current state immediately so we don't wait for the first notification.
+        fetchCurrentTrackInfo()
     }
 
-    private func startListeningInternal() {
+    /// Starts a lightweight process that emits "CHANGED" signals when media
+    /// state changes. No data fetching happens in this process — it only
+    /// watches for MediaRemote notifications.
+    private func startWatchProcess() {
         guard let scriptPath = perlScriptPath else {
             return
         }
@@ -165,98 +239,92 @@ public class MediaController {
             return
         }
 
-        listeningProcess = Process()
-        listeningProcess?.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        watchProcess = Process()
+        watchProcess?.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        watchProcess?.qualityOfService = .background
 
         var arguments = [scriptPath]
         if let bundleId = bundleIdentifier {
             arguments.append("--id")
             arguments.append(bundleId)
         }
-        arguments.append(contentsOf: [libraryPath, "loop"])
-        listeningProcess?.arguments = arguments
+        arguments.append(contentsOf: [libraryPath, "watch"])
+        watchProcess?.arguments = arguments
 
         let outputPipe = Pipe()
-        listeningProcess?.standardOutput = outputPipe
+        watchProcess?.standardOutput = outputPipe
 
-        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] fileHandle in
+        outputPipe.fileHandleForReading.readabilityHandler = {
+            [weak self, weak outputPipe] fileHandle in
             guard let self = self else { return }
 
             let incomingData = fileHandle.availableData
             if incomingData.isEmpty {
-                // This can happen when the process terminates.
+                // EOF — pipe closed. Stop the handler to prevent a spin loop.
+                outputPipe?.fileHandleForReading.readabilityHandler = nil
                 return
             }
 
-            self.dataBuffer.append(incomingData)
+            self.watchDataBuffer.append(incomingData)
 
-            // Process all complete lines in the buffer.
             guard let newlineData = "\n".data(using: .utf8) else { return }
-            while let range = self.dataBuffer.firstRange(of: newlineData) {
-                // Bounds check before accessing subrange
-                guard range.lowerBound <= self.dataBuffer.count else {
-                    break
-                }
+            while let range = self.watchDataBuffer.firstRange(of: newlineData) {
+                guard range.lowerBound <= self.watchDataBuffer.count else { break }
 
-                let lineData = self.dataBuffer.subdata(in: 0..<range.lowerBound)
+                let lineData = self.watchDataBuffer.subdata(in: 0..<range.lowerBound)
+                self.watchDataBuffer.removeSubrange(0..<range.upperBound)
 
-                // Remove the line and the newline character from the buffer.
-                self.dataBuffer.removeSubrange(0..<range.upperBound)
-
-                // Check for NIL response indicating no media player
-                if lineData == "NIL".data(using: .utf8) {
-                    DispatchQueue.main.async {
-                        self.onTrackInfoReceived?(nil)
-                    }
-                    continue
-                }
-
-                if !lineData.isEmpty {
-                    self.eventCount += 1
-
-                    do {
-                        let trackInfo = try JSONDecoder().decode(TrackInfo.self, from: lineData)
-                        DispatchQueue.main.async {
-                            // Check if we need to restart after processing
-                            if self.eventCount >= self.restartThreshold {
-                                self.restartListeningProcess()
-                            } else {
-                                self.onTrackInfoReceived?(trackInfo)
-                                self.updatePlaybackTimer(with: trackInfo)
-                            }
-                        }
-                    } catch {
-                        DispatchQueue.main.async {
-                            self.onDecodingError?(error, lineData)
-                        }
-                    }
+                if lineData == "CHANGED".data(using: .utf8) {
+                    self.scheduleFetch()
                 }
             }
         }
 
-        listeningProcess?.terminationHandler = { [weak self] process in
+        watchProcess?.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.listeningProcess = nil
-                self?.playbackTimer?.invalidate()
-                // Don't call onListenerTerminated if this is a planned restart
-                if self?.eventCount != 0 {
-                    self?.onListenerTerminated?()
-                }
+                self?.watchProcess = nil
+                self?.onListenerTerminated?()
             }
         }
 
         do {
-            try listeningProcess?.run()
+            try watchProcess?.run()
         } catch {
-            print("Failed to start listening process: \(error)")
-            listeningProcess = nil
+            print("Failed to start watch process: \(error)")
+            watchProcess = nil
+        }
+    }
+
+    /// Debounces rapid "CHANGED" signals to avoid spawning too many `get` processes.
+    private func scheduleFetch() {
+        fetchDebounceItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.fetchCurrentTrackInfo()
+        }
+        fetchDebounceItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: item)
+    }
+
+    /// Spawns a short-lived `get` process to fetch the current track info.
+    /// Uses a generation counter to ignore stale responses from older fetches.
+    private func fetchCurrentTrackInfo() {
+        fetchGeneration &+= 1
+        let generation = fetchGeneration
+
+        getTrackInfo { [weak self] trackInfo in
+            guard let self = self else { return }
+            guard generation == self.fetchGeneration else { return }
+
+            self.currentTrackInfo = trackInfo
+            self.onTrackInfoReceived?(trackInfo)
         }
     }
 
     public func stopListening() {
-        listeningProcess?.terminate()
-        playbackTimer?.invalidate()
-        listeningProcess = nil
+        watchProcess?.terminate()
+        watchProcess = nil
+        fetchDebounceItem?.cancel()
+        seekDebounceItem?.cancel()
     }
 
     public func play() {
@@ -296,68 +364,16 @@ public class MediaController {
     }
 
     public func setTime(seconds: Double) {
-        seekTimer?.invalidate()
-
-        // Optimistically update the UI and our internal timer state.
-        onPlaybackTimeUpdate?(seconds)
-        self.playbackInfo = (baseTime: seconds, baseTimestamp: Date().timeIntervalSince1970)
-
-        // If we are currently playing, ensure the timer continues to run from the new
-        // optimistic position for a smooth UI experience during scrubbing.
-        if isPlaying, playbackTimer == nil || !playbackTimer!.isValid {
-            playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-                self?.handleTimerTick()
-            }
-        }
+        seekDebounceItem?.cancel()
 
         // Throttle the actual seek command to avoid overwhelming the system.
-        seekTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { [weak self] _ in
-            DispatchQueue.global(qos: .userInitiated).async {
-                self?.runPerlCommand(arguments: ["set_time", String(seconds)])
-            }
+        let item = DispatchWorkItem { [weak self] in
+            self?.runPerlCommand(arguments: ["set_time", String(seconds)])
         }
+        seekDebounceItem = item
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05, execute: item)
     }
     
-    private func updatePlaybackTimer(with trackInfo: TrackInfo) {
-        let newTrackIdentifier = trackInfo.payload.uniqueIdentifier
-        
-        // When a new track is detected, reset the progress to 0.
-        if newTrackIdentifier != self.currentTrackIdentifier {
-            self.currentTrackIdentifier = newTrackIdentifier
-            onPlaybackTimeUpdate?(0)
-        }
-
-        playbackTimer?.invalidate()
-
-        // Update our local playing state.
-        self.isPlaying = trackInfo.payload.isPlaying ?? false
-
-        guard self.isPlaying,
-              let baseTime = trackInfo.payload.elapsedTimeMicros,
-              let baseTimestamp = trackInfo.payload.timestampEpochMicros
-        else {
-            if let lastKnownTime = trackInfo.payload.elapsedTimeMicros {
-                onPlaybackTimeUpdate?(lastKnownTime / 1_000_000)
-            }
-            return
-        }
-
-        self.playbackInfo = (baseTime: baseTime / 1_000_000,
-                               baseTimestamp: baseTimestamp / 1_000_000)
-
-        playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            self?.handleTimerTick()
-        }
-    }
-
-    @objc private func handleTimerTick() {
-        guard let info = playbackInfo else { return }
-        let now = Date().timeIntervalSince1970
-        let timePassed = now - info.baseTimestamp
-        let currentElapsedTime = info.baseTime + timePassed
-        onPlaybackTimeUpdate?(currentElapsedTime)
-    }
-
     public func setShuffleMode(_ mode: TrackInfo.ShuffleMode) {
         DispatchQueue.global(qos: .userInitiated).async {
             self.runPerlCommand(arguments: ["set_shuffle_mode", String(mode.rawValue)])
@@ -370,20 +386,4 @@ public class MediaController {
         }
     }
 
-    private func restartListeningProcess() {
-        // Stop current process
-        listeningProcess?.terminate()
-        listeningProcess = nil
-
-        // Clear data buffer to free any accumulated data
-        dataBuffer.removeAll()
-
-        // Reset event count
-        eventCount = 0
-
-        // Wait a brief moment for cleanup, then restart
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.startListeningInternal()
-        }
-    }
-} 
+}
